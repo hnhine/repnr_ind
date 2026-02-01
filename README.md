@@ -1,5 +1,13 @@
 # Understanding and Controlling Repetition Neurons and Induction Heads in In-Context Learning 
 
+## Introduction
+
+This paper investigates the relationship between large language models’ (LLMs) ability to recognize repetitive input patterns and their performance on in-context learning (ICL). In contrast to prior work that has primarily focused on attention heads, we examine this relationship from the perspective of skill neurons, specifically repetition neurons. Our experiments reveal that the impact of these neurons on ICL performance varies depending on the depth of the layer in which they reside. By comparing the effects of repetition neurons and induction heads, we further identify strategies for reducing repetitive outputs while maintaining strong ICL capabilities.
+
+Venue: IJCNLP-AACL 2025 (Oral)
+
+![Figure 1: Repetition neurons and induction heads in ICL](figure/fig_1.png)
+
 The data generator lives in `script/repnr_data.py`. After installing the project dependencies (`pip install -r requirements.txt` or `pip install -e .` from the repo root), run:
 
 1. Authenticate with Hugging Face so the script can download models:
