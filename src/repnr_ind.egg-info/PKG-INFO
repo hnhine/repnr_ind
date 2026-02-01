@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: repnr-ind
+Version: 0.1.0
+Summary: Code for Understanding and Controlling Repetition Neurons and Induction Heads in In.
+Author: Nhi Hoai Doan
+Requires-Dist: torch>=2.2
+Requires-Dist: transformers>=4.40
+Requires-Dist: huggingface_hub>=0.22
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: matplotlib
+Requires-Dist: seaborn
+Requires-Dist: accelerate
+Requires-Dist: hf_transfer
+Requires-Dist: tqdm

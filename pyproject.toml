@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repnr-ind"
+version = "0.1.0"
+description = "Code for Understanding and Controlling Repetition Neurons and Induction Heads in In."
+authors = [{name = "Nhi Hoai Doan"}]
+dependencies = [
+    "torch>=2.2",
+    "transformers>=4.40",
+    "huggingface_hub>=0.22",
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "seaborn",
+    "accelerate",
+    "hf_transfer",
+    "tqdm",
+]

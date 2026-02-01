@@ -1,0 +1,10 @@
+torch>=2.2
+transformers>=4.40
+huggingface_hub>=0.22
+numpy
+pandas
+matplotlib
+seaborn
+accelerate
+hf_transfer
+tqdm

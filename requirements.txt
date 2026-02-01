@@ -1,0 +1,15 @@
+torch==2.2.1
+transformers>=4.44.0
+huggingface_hub==0.22.2
+accelerate==0.29.3
+hf_transfer==0.1.5
+numpy==1.26.4
+pandas==2.2.2
+matplotlib==3.8.4
+seaborn==0.13.2
+ipywidgets==8.1.2
+tqdm==4.66.4
+protobuf==6.33.1
+tiktoken==0.12.0
+sentencepiece==0.2.1
+

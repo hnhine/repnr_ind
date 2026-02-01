@@ -3,8 +3,8 @@ import torch
 from tqdm.notebook import tqdm
 import json
 import os
-import repetition_neurons
-import induction_heads
+from .  import repetition_neurons
+from . import  induction_heads
 import functools
 from huggingface_hub import login
 from transformers import AutoModelForCausalLM, AutoTokenizer,  GenerationConfig
@@ -23,8 +23,9 @@ def seed_everything(seed: int):
         torch.backends.cudnn.benchmark = True
 
 def load_data(path_to_data):
-    tmp = [json.loads(line) for line in open(path_to_data)]
-    return tmp
+    with open(path_to_data, "r", encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
 
 def load_model(model_name='meta-llama/Llama-3.1-8B',
     token=None,
@@ -32,7 +33,9 @@ def load_model(model_name='meta-llama/Llama-3.1-8B',
 
     seed_everything(seed)
 
-    login(token=token)
+    hf_token = token or os.getenv("HUGGINGFACE_TOKEN")
+    if hf_token:
+        login(token=hf_token)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name, output_attentions=True, attn_implementation="eager"
@@ -42,52 +45,104 @@ def load_model(model_name='meta-llama/Llama-3.1-8B',
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
     return model, tokenizer
-def generate_answer(model, tokenizer, dataset, seed):
+def generate_answer(model, tokenizer, dataset, seed, task='abstract', rep_neuron= None,):
     seed_everything(seed)
+    assert task in ['abstract', 'wmt']
     device = model.device
     answers = []
-    for seq in tqdm(dataset,desc="Generate answer by normal mode"):
-        prompt = seq['prompt']
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        with torch.no_grad():
-            output_ids = model.generate(
-                **inputs,
-                max_new_tokens=1,
-                do_sample=False,       # Deterministic decoding
-                top_p = None,
-                temperature = None,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.eos_token_id
-            )
-        generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        answers.append(generated_text)
-    return answers
+    probe = None
+    if rep_neuron is not None:
+        by_layer = repetition_neurons._neurons_to_by_layer(rep_neuron, len(model.model.layers))
+        if by_layer:
+            probe = repetition_neurons.NeuronMeanProbe(model, by_layer)
+            probe.attach()
+    try:
+        for seq in tqdm(dataset, desc="Generate answer by normal mode"):
+            prompt = seq['prompt']
+            inputs = tokenizer(prompt, return_tensors="pt").to(device)
+            if task == 'abstract':
+                with torch.no_grad():
+                    output_ids = model.generate(
+                        **inputs,
+                        max_new_tokens=1,
+                        do_sample=False,       # Deterministic decoding
+                        top_p=None,
+                        temperature=None,
+                        eos_token_id=tokenizer.eos_token_id,
+                        pad_token_id=tokenizer.eos_token_id
+                    )
+                generated_text = tokenizer.decode(
+                output_ids[0], skip_special_tokens=True)
+            elif task == 'wmt':
+                last_source = prompt.rsplit("Source:", 1)[-1]
+                # Tokenize just that segment to measure its length
+                src_ids = tokenizer(last_source, return_tensors="pt")["input_ids"]
+                src_len = src_ids.shape[-1]
 
-def extract_answer(text, shots):
-    lines = text.split('\n')
-    if shots == 5:
-        return lines[7] if len(lines) > 7 else ""
+                # Compute max_new_tokens dynamically
+                max_new = int(src_len * 1.2)
+                with torch.no_grad():
+                    output_ids = model.generate(
+                        **inputs,
+                        max_new_tokens=max_new,
+                        do_sample=False,       # Deterministic decoding
+                        top_p=None,
+                        temperature=None,
+                        eos_token_id=tokenizer.eos_token_id,
+                        pad_token_id=tokenizer.eos_token_id
+                    )
+                input_len = inputs["input_ids"].shape[-1]
+                new_ids = output_ids[0][input_len:]
+                generated_text = tokenizer.decode(
+                    new_ids, skip_special_tokens=True)
+            answers.append(generated_text)
+    finally:
+        if probe is not None:
+            probe.release()
+    if probe is not None:
+        return answers, probe.mean_all()#probe.means_jsonable()
     else:
-        return  lines[12] if len(lines) > 12 else "" #lines[12:]' '.join(lines[12:])
-    
-def extract_answers_nor(nor_answers, shots = 5):
-    results =[]
+        return answers, None
+
+def extract_answer(text):
+    lines = text.split('\n')
+    return lines[-1]
+   
+def extract_answers_nor(nor_answers):
+    results = []
     for text in nor_answers:
-        results.append(extract_answer(text, shots)[-3:]) #modify extract class only
+        results.append(extract_answer(text).split(": ")[-1])
+    return results
+def extract_answers_nor_sst2(nor_answers, shots=5):
+    results = []
+    for text in nor_answers:
+        results.append(extract_answer(text).split(": ")[-1])
     return results
 
+def extract_answers_nor_wmt(nor_answers):
+    results = []
+    for text in nor_answers:
+        text = text.strip()
+        results.append(text.split("\n\n")[0])
+    return results
 
-def extract_answers_ab(ablation_results, shots = 5):
-    '''Extract answer after ablation both repetition neurons(all layers) and inducition heads'''
+def extract_answers_ab(ablation_results, task: str ='abstract'):
+    '''Extract answer after ablation inducition heads'''
+    assert task in ['abstract', 'wmt']
     extracted_answers = {}
     for ablation_type, percent_dict in ablation_results.items():
         extracted_answers[ablation_type] = {}
         for percent, outputs in percent_dict.items():
-                extracted_answers[ablation_type][percent]= [extract_answer(output, shots)[-3:] for output in outputs]
+            if task =='abstract':
+                extracted_answers[ablation_type][percent] = [extract_answer(
+                    output).split(": ")[-1] for output in outputs]
+            elif task =='wmt':
+                extracted_answers[ablation_type][percent] = [output.strip().split("\n\n")[0] for output in outputs]
     return extracted_answers
 
-def extract_answers_ab_layer(all_results, shots=5):
+def extract_answers_ab_layer(all_results, task='abstract'):
     '''Extract answer after ablation repetiton neurons across layer segments'''
+    assert task in ['abstract', 'wmt']
     ablation_results = {}
     if all_results:
         for mode, mode_results in all_results.items():
@@ -97,10 +152,16 @@ def extract_answers_ab_layer(all_results, shots=5):
                 for segment_result in segment_results:
                     segment_range = segment_result["segment"]
                     generated_texts = segment_result["results"]
-                    key = f"{segment_range.replace('->', '_')}" #ab_layer_{mode}_{neurons_to_ablate}_
+                    # ab_layer_{mode}_{neurons_to_ablate}_
+                    key = f"{segment_range.replace('->', '_')}"
                     extracted_list = []
                     for text in generated_texts:
-                        extracted_list.append(extract_answer(text, shots)[-3:])#modify extract here
+                        # extracted_list.append(extract_answer(text, shots)[-3:])#modify extract here
+                        if task =='abstract':
+                            ex_rs = extract_answer(text).split(": ")[-1]
+                        elif task =='wmt':
+                            ex_rs = text.strip().split("\n\n")[0]
+                        extracted_list.append(ex_rs)
                     ablation_results[mode][neurons_to_ablate][key] = extracted_list
     return ablation_results
 
@@ -132,8 +193,6 @@ def analyze_class_overview(test_dataset, classes=["Foo", "Bar"]):
         accuracy = correct_counts / total_rows
         overview[cls] = {
             "total_rows": total_rows,
-            #"correct_counts": correct_counts.to_dict(),
-            #"error_counts": error_counts.to_dict(),
             "accuracy": accuracy.to_dict()
         }
 
@@ -158,14 +217,10 @@ def split_results_by_mode(overview_results):
         accuracy_random = {k: v for k, v in metrics["accuracy"].items() if 'random' in k or k == "nor"}
         overview_results_top[cls] = {
             "total_rows": metrics["total_rows"],
-            #"correct_counts": metrics["correct_counts"],
-            #"error_counts": metrics["error_counts"],
             "accuracy": accuracy_top,
         }
         overview_results_random[cls] = {
             "total_rows": metrics["total_rows"],
-            #"correct_counts": metrics["correct_counts"],
-            #"error_counts": metrics["error_counts"],
             "accuracy": accuracy_random,
         }
 
@@ -208,7 +263,41 @@ def save_experiment_results(nor_answer,
     save_to_jsonl(ab_nr_all_result, full_file_paths["ab_nr_all_result"])
     save_to_jsonl(ab_nr_layer_result, full_file_paths["ab_nr_layer_result"])
     save_to_jsonl(ab_hd_result, full_file_paths["ab_hd_result"])
+def analyze_exp_1(ab_dataset, nor_, nr_all, hd):
+    '''Get results from first experiment, include normal answer, ablation repetition neurons and induction heads'''
+    ground_truths = [item['ground_truth'] for item in ab_dataset]
+    queries = [item['query'] for item in ab_dataset]
+    df = pd.DataFrame()
+    df['query'] = queries
+    df['ground_truth'] = ground_truths
+    df['nor'] = nor_
+    for mode, mode_results in nr_all.items():
+        for n_nr_ab, results in mode_results.items():
+            cl_name = f'ab_nr_{mode}_{n_nr_ab}'
+            df[cl_name] = results
+    for mode, mode_results in hd.items():
+        if mode == 'induction':
+            mode = 'top'
+        for n_nr_ab, results in mode_results.items():
+            cl_name = f'ab_id_{mode}_{n_nr_ab}'
+            df[cl_name] = results
+    return df
 
+
+def analyze_exp_2(ab_dataset, nor_, nr_layer):
+    ground_truths = [item['ground_truth'] for item in ab_dataset]
+    queries = [item['query'] for item in ab_dataset]
+    df = pd.DataFrame()
+    df['query'] = queries
+    df['ground_truth'] = ground_truths
+    df['nor'] = nor_
+    for mode, mode_results in nr_layer.items():
+        for n_nr_layer, segment_results in mode_results.items():
+            for segment, segment_result in segment_results.items():
+                cl_name = f"ab_ly_{mode}_{n_nr_layer}_{segment.replace('->', '_')}"
+                df[cl_name] = segment_result
+
+    return df
 
 def compute_ablation_accuracies(results_dict, mode='top', K=250):
     def class_accuracy(gt_list, pred_list, cls):
@@ -237,6 +326,71 @@ def compute_ablation_accuracies(results_dict, mode='top', K=250):
         accuracies[task] = task_acc
 
     return accuracies
+
+
+def compute_dual_ablation_accuracies_by_class(joint_results, classes=None):
+    """
+    From joint_results (with keys 'ground_truths', 'nor_', 'ab_dual'),
+    compute per-task baseline and per-segment class accuracies.
+    """
+    def normalize_label(pred):
+        if pred is None:
+            return ""
+        text = str(pred).strip()
+        if ": " in text:
+            text = text.split(": ")[-1].strip()
+        if not text:
+            return ""
+        token = text.split()[0].strip(".,;:!?\"'")
+        return token
+
+    out = {}
+    for task, info in joint_results.items():
+        gts = info["ground_truths"]
+
+        task_classes = classes if classes is not None else sorted(set(gts))
+        class_idxs = {
+            cls: [i for i, gt in enumerate(gts) if gt == cls]
+            for cls in task_classes
+        }
+
+        nor_preds = [normalize_label(p) for p in info["nor_"]]
+        baseline = {}
+        for cls, idxs in class_idxs.items():
+            if idxs:
+                baseline[cls] = sum(1 for i in idxs if nor_preds[i] == cls) / len(idxs)
+            else:
+                baseline[cls] = float("nan")
+
+        ablation = {}
+        for rep_mode, rep_block in info["ab_dual"].items():
+            ablation[rep_mode] = {}
+            for mask_mode, mask_block in rep_block.items():
+                ablation[rep_mode][mask_mode] = {}
+                for k, pct_block in mask_block.items():
+                    ablation[rep_mode][mask_mode][k] = {}
+                    for pct, seg_list in pct_block.items():
+                        seg_map = {}
+                        for seg_res in seg_list:
+                            seg = seg_res["segment"]
+                            preds = [normalize_label(p) for p in seg_res["results"]]
+                            cls_acc = {}
+                            for cls, idxs in class_idxs.items():
+                                if idxs:
+                                    cls_acc[cls] = sum(
+                                        1 for i in idxs if preds[i] == cls
+                                    ) / len(idxs)
+                                else:
+                                    cls_acc[cls] = float("nan")
+                            seg_map[seg] = cls_acc
+                        ablation[rep_mode][mask_mode][k][pct] = seg_map
+
+        out[task] = {
+            "baseline": baseline,
+            "ablation": ablation,
+        }
+
+    return out
 
 
 
@@ -290,13 +444,15 @@ def analyze_diffs_of_deactivated_neurons(deactivated_neurons, sortedNeurons):
 
 
 
-def conduct_segment_dual_ablation_2phase(model, tokenizer, dataset, neurons_by_layer_position, 
+def conduct_segment_dual_ablation_2phase(model, tokenizer, dataset, neurons_by_layer_position,
                                          segment_ranges, neurons_to_ablate, modeNr="top",
-                                         head_mask=None, shot=10, seed=42):
+                                         head_mask=None, shot=10, seed=42, task: str ='abstract'):
+    assert task in ['abstract', 'wmt']
     seed_everything(seed)
     texts = [{'ids': item['prompt']} for item in dataset]
     total_layers = len(model.model.layers)
     results = []
+
     for seg_range in segment_ranges:
         segment_neurons = []
         segment_layer_indices = set()
@@ -306,20 +462,23 @@ def conduct_segment_dual_ablation_2phase(model, tokenizer, dataset, neurons_by_l
                 segment_layer_indices.add(int(rel_pos * total_layers))
 
         if modeNr == "top":
-            segment_neurons_sorted = sorted(segment_neurons, key=lambda x: x['diffs'], reverse=True)
-            selected_neurons = [n['neuron'] for n in segment_neurons_sorted[:neurons_to_ablate]]
+            segment_neurons_sorted = sorted(
+                segment_neurons, key=lambda x: x['diffs'], reverse=True)
+            selected_neurons = [n['neuron']
+                                for n in segment_neurons_sorted[:neurons_to_ablate]]
         elif modeNr == "random":
             import random
             random.shuffle(segment_neurons)
-            selected_neurons = [n['neuron'] for n in segment_neurons[:neurons_to_ablate]]
+            selected_neurons = [n['neuron']
+                                for n in segment_neurons[:neurons_to_ablate]]
 
         neurons_by_layer = {}
         for neuron in selected_neurons:
             layer_idx, neuron_idx = neuron
             neurons_by_layer.setdefault(layer_idx, []).append(neuron_idx)
 
-        #attn_hooks = []
-        #num_layers = model.config.num_hidden_layers
+        # attn_hooks = []
+        # num_layers = model.config.num_hidden_layers
         orig_blocks = {}
         if head_mask is not None:
             block_config = {
@@ -329,6 +488,7 @@ def conduct_segment_dual_ablation_2phase(model, tokenizer, dataset, neurons_by_l
             orig_blocks = induction_heads.disable_Wo_heads(model, block_config)
 
         try:
+            # ablate repetition neurons
             deactivators = []
             for layer_idx in segment_layer_indices:
                 if layer_idx in neurons_by_layer:
@@ -339,20 +499,38 @@ def conduct_segment_dual_ablation_2phase(model, tokenizer, dataset, neurons_by_l
                             "all"
                         )
                     )
+
+            # GENERATE
             segment_results = []
             for text_dict in texts:
-                inputs = tokenizer(text_dict["ids"], return_tensors="pt").to(model.device)
-                outputs = model.generate( 
+                inputs = tokenizer(
+                    text_dict["ids"], return_tensors="pt").to(model.device)
+                if task =='abstract':
+                    max_tok = 1
+                elif task =='wmt':
+                    last_source = text_dict["ids"].rsplit("Source:", 1)[-1]
+                    src_ids = tokenizer(last_source, return_tensors="pt")["input_ids"]
+                    src_len = src_ids.shape[-1]
+                    max_tok = src_len*1.1
+                outputs = model.generate(
                     **inputs,
                     generation_config=GenerationConfig(
-                        max_new_tokens=1,
+                        max_new_tokens=max_tok,
                         do_sample=False,
                         eos_token_id=model.config.eos_token_id,
                         pad_token_id=model.config.eos_token_id,
                     ),
                 )
-                seg_ans = extract_answer(tokenizer.decode(outputs[0], skip_special_tokens=True), shot)
-                segment_results.append(seg_ans[-3:])
+                input_len = inputs["input_ids"].shape[-1]
+                new_ids = outputs[0][input_len:]
+                decoded_text = tokenizer.decode(
+                    new_ids, skip_special_tokens=True)
+                if task =='abstract':
+                    seg_ans = extract_answer(decoded_text).split(": ")[-1]
+                elif task =='wmt':
+                    seg_ans = decoded_text.strip().split("\n\n")[0]
+                #segment_results.append(seg_ans.split(": ")[-1])
+                segment_results.append(seg_ans)
 
         finally:
 
@@ -362,13 +540,28 @@ def conduct_segment_dual_ablation_2phase(model, tokenizer, dataset, neurons_by_l
                 d.release()
         results.append({
             "segment": f"{seg_range[0]}->{seg_range[1]}",
-            #"neurons_ablated": selected_neurons,
+            # "neurons_ablated": selected_neurons,
             "results": segment_results
         })
     return results
-def run_dual_ablation_study(model, tokenizer, dataset, sortedNeurons, id_avg_scores, 
-                              percent_list=[1, 3], segment_ranges=[(0, 0.2)], 
-                              neurons_to_ablate_list=[20, 50], shot=10, seed=42):
+
+
+def run_dual_ablation_study(
+    model,
+    tokenizer,
+    dataset,
+    sortedNeurons,
+    id_avg_scores,
+    percent_list=[1, 3],
+    segment_ranges=[(0, 0.2)],
+    neurons_to_ablate_list=[20, 50],
+    shot=10,
+    seed=42,
+    task: str = 'abstract',
+    dataset_name: str | None = None,
+    progress: str = "full",
+):
+    assert task in ['abstract','wmt']
     seed_everything(seed)
     num_layers = len(model.model.layers)
     num_heads = id_avg_scores[0].shape[0]
@@ -378,9 +571,15 @@ def run_dual_ablation_study(model, tokenizer, dataset, sortedNeurons, id_avg_sco
     # Build a base causal mask for attention hooks.
     global base_causal_mask
     max_seq_len = 1024
-    base_causal_mask = torch.tril(torch.ones((1, n_heads, max_seq_len, max_seq_len), dtype=torch.uint8)).to(device)
-    masks = induction_heads.build_head_masks(id_avg_scores, num_layers, num_heads, 
-                                              percent_list=percent_list, random_seed=seed)
+    base_causal_mask = torch.tril(torch.ones(
+        (1, n_heads, max_seq_len, max_seq_len), dtype=torch.uint8)).to(device)
+
+    # Build head masks using your build_head_masks function.
+    # This returns a dictionary with keys: "induction" and "random"
+    masks = induction_heads.build_head_masks(id_avg_scores, num_layers, num_heads,
+                                             percent_list=percent_list, random_seed=seed)
+
+    # Group sortedNeurons by their relative layer position.
     neurons_by_layer_position = {}
     for neuron_info in sortedNeurons:
         layer_idx, _ = neuron_info['neuron']
@@ -391,13 +590,36 @@ def run_dual_ablation_study(model, tokenizer, dataset, sortedNeurons, id_avg_sco
     rep_modes = ["top", "random"]      # for repetition neuron selection
     mask_modes = ["induction", "random"]  # for head mask selection
 
+    label = dataset_name or task
     for rep_mode in rep_modes:
         results[rep_mode] = {}
-        for mask_mode in tqdm(mask_modes, desc=f"{rep_mode} Neurons"):
+        show_mask = progress in ("full", "outer")
+        mask_iter = tqdm(
+            mask_modes,
+            desc=f"{label} | {rep_mode} neurons",
+            leave=False,
+            disable=not show_mask,
+        )
+        for mask_mode in mask_iter:
             results[rep_mode][mask_mode] = {}
-            for neurons_to_ablate in neurons_to_ablate_list:
+            show_neurons = progress == "full"
+            neuron_iter = tqdm(
+                neurons_to_ablate_list,
+                desc=f"{label} | {rep_mode}/{mask_mode}",
+                leave=False,
+                disable=not show_neurons,
+            )
+            for neurons_to_ablate in neuron_iter:
+                # print(f"ablate {neurons_to_ablate} neurons")
                 results[rep_mode][mask_mode][neurons_to_ablate] = {}
-                for p in percent_list:
+                show_percent = progress == "full"
+                percent_iter = tqdm(
+                    percent_list,
+                    #desc=f"{label} | {rep_mode}/{mask_mode}/{neurons_to_ablate}",
+                    leave=False,
+                    disable=not show_percent,
+                )
+                for p in percent_iter:
                     head_mask = masks[mask_mode][p] if mask_mode in masks and p in masks[mask_mode] else None
 
                     res = conduct_segment_dual_ablation_2phase(
@@ -408,7 +630,8 @@ def run_dual_ablation_study(model, tokenizer, dataset, sortedNeurons, id_avg_sco
                         modeNr=rep_mode,
                         head_mask=head_mask,
                         shot=shot,
-                        seed=seed
+                        seed=seed,
+                        task=task
                     )
                     results[rep_mode][mask_mode][neurons_to_ablate][p] = res
     return results

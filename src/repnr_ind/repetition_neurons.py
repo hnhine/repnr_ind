@@ -2,11 +2,12 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 import random
 import json
-import re
+import regex as re
 from tqdm import tqdm
 from huggingface_hub import login
 import functools
-
+from collections import defaultdict
+from . import induction_heads
 
 def seed_everything(seed: int):
         import random, os
@@ -199,10 +200,67 @@ def convertNeuronsToDict(neurons):
             layer2neurons[i] = []
         layer2neurons[i].append(j)
     return layer2neurons
+class Activator():
+    def __init__(self, targetLayer, neuronIds, mode, lastN=0):
+        self.neuronIds = neuronIds
+
+        assert mode in ['last', 'all', 'lastN'], 'mode should be last or all'
+        self.mode = mode
+        self.lastN = lastN
+
+        self.outputHandle = targetLayer.register_forward_hook(self.activate)
+
+    def activate(self,model, input, output):
+        if self.mode == 'last':
+          output[0, -1, self.neuronIds] += 1
+        elif self.mode == 'all':
+          output[0, :, self.neuronIds] += 1
+        elif self.mode == 'lastN':
+          output[0, -self.lastN:, self.neuronIds] += 1
+        else:
+          print(f'{self.mode=} cannot be recognized')
+          pass
+        return output
+
+    def release(self):
+        self.outputHandle.remove()
 
 
-from tqdm import tqdm
-import random
+def generateWithIntervention(model, tokenizer, initialInput, neurons, mode):
+    model.eval()
+
+    if mode=='activate':
+        INTERV = Activator
+    else:
+        INTERV = Deactivator
+
+
+    layer2neurons = convertNeuronsToDict(neurons)
+
+    if 'GemmaForCausalLM' in str(type(model)) or 'LlamaForCausalLM' in str(type(model)) or 'Qwen2ForCausalLM' in str(type(model)):
+        acts = [INTERV(layer.mlp.act_fn, layer2neurons[i], 'last') for i, layer in enumerate(model.model.layers) if i in layer2neurons]
+    elif 'GPTNeoXForCausalLM' in str(type(model)):
+        acts = [INTERV(layer.mlp.act, layer2neurons[i], 'last') for i, layer in enumerate(model.gpt_neox.layers) if i in layer2neurons]
+    elif 'PhiForCausalLM' in str(type(model)):
+        acts = [INTERV(layer.mlp.activation_fn, layer2neurons[i], 'last') for i, layer in enumerate(model.model.layers) if i in layer2neurons]
+    else:
+        print('model is not supported!')
+
+    initialInput = tokenizer(initialInput, return_tensors="pt")
+    initialInput = initialInput["input_ids"].to(model.device)
+
+    generationConfigGreedy = GenerationConfig(max_new_tokens=1, do_sample=False, 
+                                              eos_token_id=model.config.eos_token_id,
+                                              pad_token_id=model.config.eos_token_id)
+    additionalOutputs = model.generate(initialInput, generation_config=generationConfigGreedy)
+
+    for a in acts:
+        a.release()
+
+    #ngram, firstPosition, secondPosition, thirdPosition = detectRepetition(additionalOutputs[0].tolist(), n=10, r=100, k=3)
+    token_ids = additionalOutputs[0].tolist()
+    decoded_text = tokenizer.decode(token_ids)
+    return decoded_text
 def conductExpIntervention(model, tokenizer, texts, neurons, mode, selectMode, K, N=50):
     assert mode in ['activate', 'deactivate'], 'mode should be activate or deactivate'
     assert selectMode in ['top', 'random'], 'selectMode should be top or random'
@@ -232,7 +290,7 @@ def conductExpIntervention(model, tokenizer, texts, neurons, mode, selectMode, K
     return logs#, numRep
 
 def run_segment_ablation_study_2phase(model, tokenizer, texts, sortedNeurons, 
-                                      segment_ranges =None, neurons_to_ablate_list=None, seed=42):
+                                      segment_ranges =None, neurons_to_ablate_list=None, seed=42, task='abstract'):
     """
     Run segment-wise ablation studies for both 'top' and 'random' modes.
 
@@ -248,6 +306,7 @@ def run_segment_ablation_study_2phase(model, tokenizer, texts, sortedNeurons,
     - all_results: Aggregated results for both 'top' and 'random' modes.
     """
     seed_everything(seed)
+    assert task in ['abstract', 'wmt']
     if segment_ranges is None:
         segment_ranges = [(0, 0.2), (0.4, 0.6), (0.8, 1.0)]
 
@@ -274,7 +333,7 @@ def run_segment_ablation_study_2phase(model, tokenizer, texts, sortedNeurons,
             results = conduct_segment_ablation_2phase(
                 model, tokenizer, texts, 
                 neurons_by_layer_position, segment_ranges, 
-                neurons_to_ablate, mode=mode, seed=seed
+                neurons_to_ablate, mode=mode, seed=seed, task=task
             )
             all_results[mode][neurons_to_ablate] = results
 
@@ -282,7 +341,7 @@ def run_segment_ablation_study_2phase(model, tokenizer, texts, sortedNeurons,
 
 
 def conduct_segment_ablation_2phase(model, tokenizer, dataset, neurons_by_layer_position, 
-                                    segment_ranges, neurons_to_ablate, mode="top", seed=42):
+                                    segment_ranges, neurons_to_ablate, mode="top", seed=42, task='abstract'):
     """
     Perform ablation by deactivating a specific number of neurons in each segment of the model.
 
@@ -318,7 +377,6 @@ def conduct_segment_ablation_2phase(model, tokenizer, dataset, neurons_by_layer_
             neurons_to_ablate_list = [neuron['neuron'] for neuron in segment_neurons_sorted[:neurons_to_ablate]]
         elif mode == "random":
             # Randomly select neurons
-            import random
             random.shuffle(segment_neurons)
             neurons_to_ablate_list = [neuron['neuron'] for neuron in segment_neurons[:neurons_to_ablate]]
         else:
@@ -340,24 +398,47 @@ def conduct_segment_ablation_2phase(model, tokenizer, dataset, neurons_by_layer_
 
         segment_results = []
         for text in texts:#tqdm(texts, desc=f"Segment {i+1}", unit="text"):
-            text = text['ids']
-            initialInput = tokenizer(text, return_tensors="pt")
-            initialInput = initialInput["input_ids"].to(model.device)
-
             # Inference with intervention
-            generationConfigGreedy = GenerationConfig(
-                max_new_tokens=1,
-                do_sample=False,
-                eos_token_id=model.config.eos_token_id,
-                pad_token_id=model.config.eos_token_id,
-                top_p=0,
-                temperature=1.0, 
-            )
-            additionalOutputs = model.generate(initialInput, generation_config=generationConfigGreedy)
+            if task == 'abstract':
+                text = text['ids']
+                initialInput = tokenizer(text, return_tensors="pt")
+                initialInput = initialInput["input_ids"].to(model.device)
+                generationConfigGreedy = GenerationConfig(
+                    max_new_tokens=1,
+                    do_sample=False,
+                    eos_token_id=model.config.eos_token_id,
+                    pad_token_id=model.config.eos_token_id,
+                    #top_p=0,
+                    temperature=1.0, 
+                )
+                additionalOutputs = model.generate(initialInput, generation_config=generationConfigGreedy)
 
-            # Decode output
-            token_ids = additionalOutputs[0].tolist()
-            decoded_text = tokenizer.decode(token_ids)
+                # Decode output
+                token_ids = additionalOutputs[0].tolist()
+                decoded_text = tokenizer.decode(token_ids)
+            elif task == 'wmt':
+                inputs = tokenizer(text['ids'], return_tensors="pt").to(model.device)
+
+                last_source = text['ids'].rsplit("Source:", 1)[-1]
+                src_ids = tokenizer(last_source, return_tensors="pt")["input_ids"]
+                src_len = src_ids.shape[-1]
+
+                # Compute max_new_tokens dynamically
+                max_new = int(src_len * 1.2)
+                with torch.no_grad():
+                    output_ids = model.generate(
+                        **inputs,
+                        max_new_tokens=max_new,
+                        do_sample=False,       # Deterministic decoding
+                        top_p=None,
+                        temperature=None,
+                        eos_token_id=tokenizer.eos_token_id,
+                        pad_token_id=tokenizer.eos_token_id
+                    )
+                input_len = inputs["input_ids"].shape[-1]
+                new_ids = output_ids[0][input_len:]
+                decoded_text = tokenizer.decode(
+                    new_ids, skip_special_tokens=True)
             segment_results.append(decoded_text)
 
         # Release all deactivators
@@ -367,88 +448,11 @@ def conduct_segment_ablation_2phase(model, tokenizer, dataset, neurons_by_layer_
         # Save results for the current segment
         results.append({
             "segment": f"{start}->{end}",
-            "neurons_ablated": neurons_to_ablate_list,
+            #"neurons_ablated": neurons_to_ablate_list,
             "results": segment_results
         })
 
     return results
-
-def wrap_neuron_intervention_forward(original_forward, neuron_indices, mode='deactivate'):
-    """
-    Wraps the MLP forward function to intervene on selected neurons.
-
-    Args:
-        original_forward (Callable): The original forward function of the MLP module.
-        neuron_indices (list): List of indices (within the hidden dimension) corresponding to the neurons to intervene.
-        mode (str): Intervention mode. 'deactivate' zeros out the neurons; 'activate' sets them to a fixed value.
-
-    Returns:
-        Callable: The wrapped forward function.
-    """
-    @functools.wraps(original_forward)
-    def wrapped_forward(*args, **kwargs):
-        # Get the output from the original forward pass.
-        # Expected output shape: [batch_size, seq_length, hidden_dim]
-        output = original_forward(*args, **kwargs)
-
-        # Intervention on the selected neurons.
-        if mode == 'deactivate':
-            # Zero out activations for the chosen neuron indices.
-            for neuron_idx in neuron_indices:
-                output[..., neuron_idx] = 0.0
-        elif mode == 'activate':
-            # As an example, force the activation to a constant value (e.g., 1.0).
-            for neuron_idx in neuron_indices:
-                output[..., neuron_idx] = 1.0
-        else:
-            raise ValueError("Unsupported mode. Choose 'deactivate' or 'activate'.")
-        
-        return output
-
-    return wrapped_forward
-
-
-def set_neuron_intervention_hooks(model, target_neurons, mode='deactivate'):
-    """
-    Installs hooks on the model's MLP modules to intervene on selected repetition neurons.
-    
-    Args:
-        model: Transformer model.
-        target_neurons (list): List of tuples (layer_idx, neuron_idx) specifying the neurons to intervene.
-        mode (str): Intervention mode. Options are 'deactivate' or 'activate'.
-        
-    Returns:
-        hooks (list): List of tuples (layer_idx, original_forward) to allow removal later.
-    """
-    hooks = {}
-    
-    # Group the target neurons by their layer index.
-    neurons_by_layer = {}
-    for layer_idx, neuron_idx in target_neurons:
-        neurons_by_layer.setdefault(layer_idx, []).append(neuron_idx)
-    
-    # Loop over each layer that has target neurons.
-    # It is assumed that the MLP (or feedforward) module is located at model.model.layers[layer_idx].mlp.
-    for layer_idx, neuron_list in neurons_by_layer.items():
-        mlp_module = model.model.layers[layer_idx].mlp
-        original_forward = mlp_module.forward
-        mlp_module.forward = wrap_neuron_intervention_forward(original_forward, neuron_list, mode)
-        hooks[layer_idx] = original_forward
-    
-    return hooks
-
-
-def remove_neuron_intervention_hooks(model, hooks):
-    """
-    Restores the original forward functions for the MLP modules after neuron intervention.
-
-    Args:
-        model: Transformer model.
-        hooks (dict): Dictionary mapping layer_idx to the original forward function.
-    """
-    for layer_idx, original_forward in hooks.items():
-        model.model.layers[layer_idx].mlp.forward = original_forward
-
 
 
 
@@ -481,3 +485,162 @@ def compute_ablation_accuracies(results_dict, mode='top', K=250):
         accuracies[task] = task_acc
 
     return accuracies
+
+class NeuronMeanProbe:
+    """
+    Compute mean activation (after act_fn) for repetition neurons only
+    Calculated by (layer, neuron).
+    """
+    def __init__(self, model, neurons_by_layer):
+        self.model = model
+        self.neurons_by_layer = {int(k): sorted(set(v)) for k, v in neurons_by_layer.items()}
+        self._handles = []
+        self._sums = defaultdict(float)    # (layer, neuron) -> sum
+        self._counts = defaultdict(int)    # (layer, neuron) -> B*T
+
+    def _make_hook(self, layer_idx, neuron_idx_list):
+        idx_tensor = None  
+
+        def hook(module, inputs, output):
+            nonlocal idx_tensor
+            y = output                          # [B, T, H_intermediate]
+            B, T, _ = y.shape
+            if T <= 1:
+                return
+            time_sel = slice(T-1, T)            # last time step of the prompt
+
+            if idx_tensor is None:
+                idx_tensor = torch.as_tensor(neuron_idx_list, device=y.device)
+
+            # [B, 1, K] in the last token of prompt
+            picked = y[:, time_sel, :][..., idx_tensor]   # [B, 1, K]
+            with torch.no_grad():
+                sums_vec = picked.sum(dim=(0, 1))         # [K]
+                cnt = picked.shape[0] * picked.shape[1]   # = B * 1
+                for j, n_idx in enumerate(neuron_idx_list):
+                    key = (layer_idx, int(n_idx))
+                    self._sums[key] += float(sums_vec[j].item())
+                    self._counts[key] += int(cnt)
+
+        return hook
+
+    def attach(self):
+        for l, layer in enumerate(self.model.model.layers):
+            if l in self.neurons_by_layer:
+                h = layer.mlp.act_fn.register_forward_hook(
+                    self._make_hook(l, self.neurons_by_layer[l])
+                )
+                self._handles.append(h)
+
+    def release(self):
+        for h in self._handles:
+            h.remove()
+        self._handles.clear()
+
+    def mean_all(self):
+        vals = []
+        for (l, n), s in self._sums.items():
+            c = self._counts.get((l, n), 0)
+            if c > 0:
+                vals.append(s / c)
+        avg = float(sum(vals) / len(vals)) if vals else float('nan')
+        return round(avg,4)
+
+        
+
+
+def _to_block_config_from_mask(head_mask):
+    """
+    head_mask: Tensor[num_layers, num_heads] với 0.0 = ablate
+    """
+    if head_mask is None:
+        return {}
+    if isinstance(head_mask, dict):
+        return head_mask
+    block = {}
+    for l in range(head_mask.size(0)):
+        row = head_mask[l]
+        if torch.is_tensor(row):
+            row = row.detach().float().cpu().tolist()
+        off = [h for h, v in enumerate(row) if float(v) == 0.0]
+        if off:
+            block[l] = off
+    return block
+def _neurons_to_by_layer(neuron_list, num_layers):
+    """
+    neuron_list: [(layer, idx)] hoặc [{'neuron': (layer, idx), ...}, ...]
+    -> {layer: [idx, ...]}
+    """
+    by_layer = {}
+    for it in neuron_list:
+        if isinstance(it, dict) and "neuron" in it:
+            l, n = it["neuron"]
+        else:
+            l, n = it
+        l, n = int(l), int(n)
+        if 0 <= l < num_layers:
+            by_layer.setdefault(l, []).append(n)
+    for l in by_layer:
+        by_layer[l] = sorted(set(by_layer[l]))
+    return by_layer
+
+@torch.no_grad()
+def measure_rep_neuron_means(model, tokenizer, dataset, target_neurons, head_mask=None):
+    """
+    Measure mean activation after act_fn for repetition neurons.
+
+    """
+    device = model.device
+    num_layers = len(model.model.layers)
+    by_layer = _neurons_to_by_layer(target_neurons, num_layers)
+    probe = NeuronMeanProbe(model, by_layer)
+
+
+    orig_blocks = {}
+    block_config = _to_block_config_from_mask(head_mask)
+    if block_config:
+        orig_blocks = induction_heads.disable_Wo_heads(model, block_config)
+
+    try:
+        probe.attach()
+        for ex in dataset:
+            if isinstance(ex, dict):
+                text = ex.get("prompt", ex.get("ids", None))
+            else:
+                text = str(ex)
+            if text is None:
+                continue
+            inputs = tokenizer(text, return_tensors="pt").to(device)
+            _ = model(**inputs, use_cache=False)  
+    finally:
+        probe.release()
+        if orig_blocks:
+            induction_heads.restore_Wo_heads(model, orig_blocks)
+
+    return probe.means()
+
+
+def compute_rep_neuron_deltas(model, tokenizer, dataset, target_neurons, head_mask):
+    """
+    Compute Δa_n = E[a | head off] - E[a | head on] for each repetition neurons.
+    """
+    base = measure_rep_neuron_means(model, tokenizer, dataset, target_neurons, head_mask=None)
+    off  = measure_rep_neuron_means(model, tokenizer, dataset, target_neurons, head_mask=head_mask)
+    keys = set(base.keys()) | set(off.keys())
+    deltas = {k: (off.get(k, 0.0) - base.get(k, 0.0)) for k in keys}
+    return deltas, base, off
+
+
+def aggregate_by_segments(values_dict, num_layers, segments=[(0.0,0.2),(0.4,0.6),(0.8,1.0)]):
+    """
+    Compute by layer segment
+    """
+    out = {}
+    for lo, hi in segments:
+        loL, hiL = int(num_layers*lo), int(num_layers*hi) - 1
+        acc, cnt = 0.0, 0
+        for (l, _), v in values_dict.items():
+            if loL <= l <= hiL:
+                acc += float(v); cnt += 1
+        out[f"{lo}->{hi}"] = (acc/cnt) if cnt>0 else 0.0
+    return out

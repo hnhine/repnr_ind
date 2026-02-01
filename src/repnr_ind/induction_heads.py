@@ -11,22 +11,7 @@ import os
 import torch.nn.functional as F
 from types import MethodType
 import matplotlib.pyplot as plt
-
-def seed_everything(seed=42):
-    """
-    Sets random seeds for reproducibility.
-
-    Args:
-        seed (int, optional): Random seed value. Defaults to 42.
-    """
-    import random
-    import numpy as np
-    import torch
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
+from . import utils
 
 
 def compute_prefix_matching_scores(model, tokenizer, num_sequences=5, sequence_length=50, device=0):
@@ -107,29 +92,6 @@ def compute_prefix_matching_scores(model, tokenizer, num_sequences=5, sequence_l
     avg_scores = [mean[layer_idx].clone().detach().cpu() for layer_idx in range(num_layers)]
     return avg_scores
 
-
-def set_block_attn_hooks(model, block_config, model_type):
-    hooks = []
-    head_dim = model.config.hidden_size // model.config.num_attention_heads
-
-    for layer_idx, layer in enumerate(model.model.layers):
-        heads_to_zero = block_config.get(layer_idx, [])
-        if heads_to_zero:                             # chỉ khi có head cần ablate
-            orig = layer.self_attn.forward
-            layer.self_attn.forward = wrap_attn_forward_zero_input(
-                orig, layer_idx, block_config, model, model_type   # truyền list, không truyền dict
-            )
-            hooks.append((layer_idx, orig))
-        else:
-            hooks.append((layer_idx, layer.self_attn.forward))
-    return hooks
-
-
-def remove_attn_hooks(model, hooks, model_type):
-    for layer_idx, orig in hooks:
-        model.model.layers[layer_idx].self_attn.forward = orig
-
-
 def build_head_masks(avg_scores, num_layers, num_heads, percent_list=[1, 3, 5, 7, 10], random_seed=42):
     """
     Build induction and random ablation masks exactly as in Sec. 4.3:
@@ -148,12 +110,10 @@ def build_head_masks(avg_scores, num_layers, num_heads, percent_list=[1, 3, 5, 7
     masks = {"induction": {}, "random": {}}
 
     # Flatten all layer-head scores into a single vector
-    all_flat = torch.cat([s for s in avg_scores])  # shape [num_layers * num_heads]
+    all_flat = torch.cat([s for s in avg_scores]) 
 
     for p in percent_list:
-        # Number of heads to ablate in total
         n_ablate = math.ceil(num_layers * num_heads * (p / 100))
-        # Find indices of the top-n_ablate scores
         _, topk_idx = torch.topk(all_flat, n_ablate)
 
         # Initialize induction mask: 1 = keep, 0 = ablate
@@ -164,7 +124,6 @@ def build_head_masks(avg_scores, num_layers, num_heads, percent_list=[1, 3, 5, 7
             induction_mask[layer, head] = 0.0
         masks["induction"][p] = induction_mask
 
-        # Build random mask with the same per-layer counts
         rnd_mask = torch.ones_like(induction_mask)
         rng = random.Random(random_seed)
         for layer in range(num_layers):
@@ -177,54 +136,6 @@ def build_head_masks(avg_scores, num_layers, num_heads, percent_list=[1, 3, 5, 7
         masks["random"][p] = rnd_mask
 
     return masks
-
-
-def ablate_attention_heads(model, tokenizer, avg_scores, test_dataset, percent_list=None, seed=42):
-    print("Ablation induction heads ... ")
-
-    if percent_list is None:
-        percent_list = [1, 3, 5, 7, 10]
-
-    seed_everything(seed)
-
-    num_layers = len(avg_scores)
-    num_heads = avg_scores[0].shape[0]
-    n_heads = model.config.num_attention_heads
-    device = model.device
-
-    global base_causal_mask
-    max_seq_len = 1024
-    base_causal_mask = torch.tril(torch.ones((1, n_heads, max_seq_len, max_seq_len), dtype=torch.uint8)).to(device)
-
-    masks = build_head_masks(avg_scores, num_layers, num_heads, percent_list)
-
-    results = {}
-
-    for ablation_type in ['induction', 'random']:
-        #print("Ablate head type ", ablation_type)
-        results[ablation_type] = {}
-
-        for p in tqdm(percent_list, desc="Percent list ..."):
-            #print(f"Processing {ablation_type} ablation for {p}%...")
-            
-            this_mask = masks[ablation_type][p]
-
-            ablated_outputs = generate_ablated_outputs(
-                model=model,
-                tokenizer=tokenizer,
-                test_dataset=test_dataset,
-                device=device,
-                head_mask=this_mask,
-                model_type=model.config.model_type
-            )
-
-            # for result in ablated_outputs:
-            #     result["ablation_type"] = ablation_type
-            #     result["percentage"] = p
-            results[ablation_type][p] = ablated_outputs
-
-    return results
-
 def disable_Wo_heads(model, block_config):
     """
     Zero out each block Wo_h in o_proj.weight.
@@ -256,7 +167,7 @@ def ablate_attention_heads_8(model, tokenizer, avg_scores, test_dataset, percent
     if percent_list is None:
         percent_list = [1, 3, 5, 7, 10]
 
-    seed_everything(seed)
+    utils.seed_everything(seed)
 
     num_layers = len(avg_scores)
     num_heads = avg_scores[0].shape[0]
@@ -272,7 +183,6 @@ def ablate_attention_heads_8(model, tokenizer, avg_scores, test_dataset, percent
                 layer: [h for h, v in enumerate(mask[layer].tolist()) if v == 0.0]
                 for layer in range(num_layers)
             }
-            #print(f"[DEBUG] {ab_type=} {p=} => ablate heads:", block_config)
 
             # 2) Disable Wo_h
             try:
@@ -293,7 +203,7 @@ def ablate_attention_heads_8(model, tokenizer, avg_scores, test_dataset, percent
                             max_new_tokens=1,
                             do_sample=False,
                             pad_token_id=tokenizer.eos_token_id,
-                            temperature=1.0,       # Disable temperature
+                            temperature=1.0,       
                             top_p=1.0,
                         )
                     ablated.append(tokenizer.decode(out_ids[0], skip_special_tokens=True))
